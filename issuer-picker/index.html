@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Issuer picker — Sigma plugin</title>
+<!--
+  MPC issuer picker — a Sigma custom plugin (@sigmacomputing/plugin), single file, no build step.
+  Single-line autocomplete (Lin 2026-10-29: "free type … arrow up and down … hit enter, it will be the end of the search";
+  shape ruling: "Single-line autocomplete"): the box shows the current issuer's label; typing replaces it and shows the best
+  candidate inline with an "n / N" badge; ArrowDown / ArrowUp cycle the candidates; Enter picks (writes the issuer control and
+  fires the On pick action); Escape restores. Sigma plugins render inside a fixed iframe, so nothing floats over the page.
+  Editor panel (bound from the workbook spec `config`):
+    source        element  — the issuer list (one row per issuer, pre-sorted: held issuers first, then name)
+    idColumn      column   — the issuer identifier written to the control
+    labelColumn   column   — the label shown ("Name - Alias - LX | LX - FIGI - CUSIP - Sector - Ticker")
+    searchColumn  column   — optional lower-case haystack; falls back to the label
+    issuer        variable — the issuer control (text / single-select list)
+    onPick        action-trigger — fired after the control is set (clear instrument / trade side etc.)
+    placeholder   text     — the empty-box hint
+  Synthetic fallback: opened standalone (no Sigma client) it renders eight demo issuers so the UX can be tried anywhere.
+-->
+<style>
+  :root { --bg:#E4EEE8; --fg:#1F2D3D; --muted:#6B7684; --badge:#2F4A6B; --line:#C9D2CC; --font:"Inter",-apple-system,"Segoe UI","Helvetica Neue",Arial,sans-serif; }
+  html,body{margin:0;padding:0;height:100%;background:transparent;font-family:var(--font);}
+  #wrap{position:relative;box-sizing:border-box;height:100%;min-height:28px;display:flex;align-items:stretch;}
+  #box{position:relative;flex:1 1 auto;display:flex;align-items:center;box-sizing:border-box;background:var(--bg);border:1px solid var(--line);border-radius:0;padding:0 8px;overflow:hidden;cursor:text;}
+  #box.focus{border-color:#2F4A6B;box-shadow:inset 0 0 0 1px #2F4A6B;}
+  #q{flex:0 1 auto;min-width:40px;max-width:60%;border:0;outline:0;background:transparent;font:inherit;font-size:13px;color:var(--fg);padding:0;margin:0;height:100%;}
+  #q::placeholder{color:#8A96A3;}
+  #cand{flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:13px;color:var(--fg);padding-left:8px;cursor:pointer;}
+  #cand.ghost{color:var(--muted);}
+  #cand.none{color:#B04A4A;}
+  #cand.current{color:var(--fg);}
+  #badge{flex:0 0 auto;margin-left:8px;font-size:11px;line-height:16px;padding:0 6px;border-radius:8px;background:var(--badge);color:#fff;display:none;}
+  #hint{flex:0 0 auto;margin-left:6px;font-size:11px;color:var(--muted);display:none;white-space:nowrap;}
+  @media (max-width:520px){#hint{display:none !important;}}
+</style>
+</head>
+<body>
+<div id="wrap"><div id="box"><input id="q" type="text" autocomplete="off" spellcheck="false" aria-label="Issuer search"><div id="cand"></div><span id="badge"></span><span id="hint"></span></div></div>
+<script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/@sigmacomputing/plugin"></script>
+<script>
+(function () {
+  'use strict';
+  var SDK = window.SigmaPlugin || window.sigmaPlugin || null;
+  var client = SDK && SDK.client ? SDK.client : null;
+
+  // ---------- state ----------
+  var rows = [];            // [{id, label, hay}]
+  var byId = Object.create(null);
+  var current = null;       // current issuer id (from the workbook variable)
+  var query = '';           // what the user typed (empty = idle)
+  var cands = [];           // matching rows (source order)
+  var idx = 0;              // highlighted candidate
+  var cfg = {};             // editor-panel config
+  var varId = null, actId = null;
+  var MAXC = 500;
+
+  var $box = document.getElementById('box'), $q = document.getElementById('q'), $cand = document.getElementById('cand'),
+      $badge = document.getElementById('badge'), $hint = document.getElementById('hint');
+
+  function norm(s) { return String(s == null ? '' : s).toLowerCase(); }
+  function tokens(q) { return norm(q).split(/\s+/).filter(Boolean); }
+  function search(q) {
+    var t = tokens(q); if (!t.length) return [];
+    var out = [];
+    for (var i = 0; i < rows.length && out.length < MAXC; i++) {
+      var h = rows[i].hay, ok = true;
+      for (var k = 0; k < t.length; k++) { if (h.indexOf(t[k]) < 0) { ok = false; break; } }
+      if (ok) out.push(rows[i]);
+    }
+    return out;
+  }
+  function render() {
+    var idle = !query;
+    $q.placeholder = cfg.placeholder || 'Name · FIGI · LoanX · CUSIP';
+    if (idle) {
+      var cur = current && byId[current] ? byId[current].label : '';
+      if ($q.value) $q.value = '';
+      $q.placeholder = cur ? '' : (cfg.placeholder || 'Name · FIGI · LoanX · CUSIP');
+      $cand.textContent = cur; $cand.className = cur ? 'current' : ''; $badge.style.display = 'none'; $hint.style.display = 'none';
+      $q.style.maxWidth = cur ? '12px' : '100%'; $q.style.flex = cur ? '0 0 auto' : '1 1 auto'; $q.style.minWidth = cur ? '12px' : '40px';
+      return;
+    }
+    $q.style.minWidth = '40px';
+    $q.style.maxWidth = '45%'; $q.style.flex = '0 1 auto';
+    if (!cands.length) { $cand.textContent = rows.length ? 'no issuer matches' : 'loading issuers…'; $cand.className = 'none'; $badge.style.display = 'none'; $hint.style.display = 'none'; return; }
+    var c = cands[idx];
+    $cand.textContent = c.label; $cand.className = 'ghost';
+    $badge.textContent = (idx + 1) + ' / ' + cands.length + (cands.length >= MAXC ? '+' : ''); $badge.style.display = 'inline-block';
+    $hint.textContent = '↑↓ Enter'; $hint.style.display = 'inline';
+  }
+  function setQuery(q) { query = q; cands = search(q); idx = 0; render(); }
+  function pick(row) {
+    if (!row) return;
+    current = row.id;
+    if (client && varId) { try { client.config.setVariable(varId, String(row.id)); } catch (e) { console.warn('setVariable', e); } }
+    if (client && actId) { setTimeout(function () { try { client.config.triggerAction(actId); } catch (e) { console.warn('triggerAction', e); } }, 0); }
+    query = ''; cands = []; idx = 0; render();
+  }
+  function restore() { query = ''; cands = []; idx = 0; render(); }
+
+  $q.addEventListener('focus', function () { $box.classList.add('focus'); });
+  $q.addEventListener('blur', function () { $box.classList.remove('focus'); if (query) restore(); });
+  $box.addEventListener('mousedown', function (e) { if (e.target !== $q) { e.preventDefault(); $q.focus(); } });
+  $cand.addEventListener('mousedown', function (e) { e.preventDefault(); if (query && cands.length) pick(cands[idx]); else $q.focus(); });
+  $q.addEventListener('input', function () { setQuery($q.value); });
+  $q.addEventListener('keydown', function (e) {
+    if (e.key === 'ArrowDown') { e.preventDefault(); if (cands.length) { idx = (idx + 1) % cands.length; render(); } }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); if (cands.length) { idx = (idx - 1 + cands.length) % cands.length; render(); } }
+    else if (e.key === 'Enter') { e.preventDefault(); if (cands.length) pick(cands[idx]); }
+    else if (e.key === 'Escape') { e.preventDefault(); restore(); $q.blur(); }
+    else if (e.key === 'Tab') { if (query) restore(); }
+  });
+
+  // ---------- data ----------
+  function ingest(data, columns) {
+    var idc = cfg.idColumn, lc = cfg.labelColumn, sc = cfg.searchColumn;
+    if (!idc || !lc || !data || !data[idc] || !data[lc]) return;
+    var ids = data[idc], labels = data[lc], hays = sc && data[sc] ? data[sc] : null;
+    var out = [], map = Object.create(null);
+    for (var i = 0; i < ids.length; i++) {
+      if (ids[i] == null) continue;
+      var r = { id: String(ids[i]), label: labels[i] == null ? String(ids[i]) : String(labels[i]), hay: norm(hays ? hays[i] : labels[i]) };
+      out.push(r); map[r.id] = r;
+    }
+    rows = out; byId = map;
+    if (query) { cands = search(query); idx = Math.min(idx, Math.max(cands.length - 1, 0)); }
+    render();
+  }
+  function unwrapVar(raw) {
+    if (raw == null) return null;
+    if (typeof raw !== 'object') return raw;
+    var v = raw.defaultValue && raw.defaultValue.value !== undefined ? raw.defaultValue.value : (raw.value !== undefined ? raw.value : null);
+    if (Array.isArray(v)) v = v.length ? v[0] : null;
+    return v == null ? null : String(v);
+  }
+
+  var unsubData = null, unsubVar = null, lastRowCount = -1, gotConfig = false;
+  function maybeFetchMore(sourceId, count) {
+    // the SDK pages element data (25,000 values per page); pull until the row count stops growing
+    if (!client || !client.elements || typeof client.elements.fetchMoreElementData !== 'function') return;
+    if (count > lastRowCount) { lastRowCount = count; try { client.elements.fetchMoreElementData(sourceId); } catch (e) { /* no more pages */ } }
+  }
+  function wire() {
+    if (!client) return false;
+    client.config.configureEditorPanel([
+      { name: 'source', type: 'element', label: 'Issuer list' },
+      { name: 'idColumn', type: 'column', source: 'source', allowMultiple: false, label: 'Issuer id' },
+      { name: 'labelColumn', type: 'column', source: 'source', allowMultiple: false, label: 'Label' },
+      { name: 'searchColumn', type: 'column', source: 'source', allowMultiple: false, label: 'Search text (optional)' },
+      { name: 'issuer', type: 'variable', label: 'Issuer control', allowedTypes: ['text', 'text-list'] },
+      { name: 'onPick', type: 'action-trigger', label: 'On pick' },
+      { name: 'placeholder', type: 'text', label: 'Placeholder', defaultValue: 'Name · FIGI · LoanX · CUSIP' }
+    ]);
+    client.config.subscribe(function (c) {
+      gotConfig = true;
+      cfg = c || {};
+      varId = cfg.issuer || null; actId = cfg.onPick || null;
+      if (unsubVar) { try { unsubVar(); } catch (e) {} unsubVar = null; }
+      if (varId) {
+        try { unsubVar = client.config.subscribeToWorkbookVariable(varId, function (v) { current = unwrapVar(v); if (!query) render(); }); } catch (e) { console.warn('subscribeToWorkbookVariable', e); }
+        try { var v0 = client.config.getVariable(varId); if (v0 && typeof v0.then === 'function') v0.then(function (v) { current = unwrapVar(v); if (!query) render(); }); else { current = unwrapVar(v0); } } catch (e) {}
+      }
+      if (unsubData) { try { unsubData(); } catch (e) {} unsubData = null; }
+      lastRowCount = -1;
+      var sourceId = cfg.source;
+      if (sourceId) {
+        unsubData = client.elements.subscribeToElementData(sourceId, function (data) {
+          ingest(data);
+          var idc = cfg.idColumn; var n = idc && data && data[idc] ? data[idc].length : 0;
+          maybeFetchMore(sourceId, n);
+        });
+      }
+      render();
+    });
+    return true;
+  }
+
+  // ---------- synthetic fallback ----------
+  function synth() {
+    var demo = [
+      ['fd22ee40', '1440 Foods Topco, LLC - 1440 Foods - LX249775 | LX254754 - BBG01R03FCJ9 - 68239HAB8 - Food Products - FOOAA'],
+      ['50000190', 'Restoration Hardware, Inc. - RH - LX199008 | LX204424 - BBG012R3RRT8 | BBG017251819 - 76133MAB7 | 76133MAC5 - Specialty Retail - REHA'],
+      ['a1', 'ATI Restoration, LLC - LX189323 | LX189324 - Commercial Services and Supplies - ATIRES'],
+      ['a2', 'American Restoration Holdings, LLC - LX239073 | LX239074 - 02928TAB7 - Construction and Engineering - AMERREBG'],
+      ['a3', 'Compass Restoration Intermediary Holdings, LLC - LX259721 | LX259722 - Capital Markets - COMPREAA'],
+      ['a4', '84 Lumber Company - 84 LUMBER CO - LX219974 | LX234116 - BBG01K4J9ML7 - 28248CAK2 - Construction Materials - LUMAA'],
+      ['a5', 'A-AG US GSI Bidco, Inc. - A-AG HOLDCO, LIMITED - LX247719 | LX260912 - BBG01PZT8LZ8 - 00033RAB7 - Machinery - AAGUS'],
+      ['a6', 'Red Planet Borrower, LLC - Liftoff Mobile - LX198240 | LX251097 - BBG012G3K631 - 57165KAB2 - Software - REDPLAAA']
+    ];
+    cfg = { idColumn: 'id', labelColumn: 'label', placeholder: 'Name · FIGI · LoanX · CUSIP (demo)' };
+    ingest({ id: demo.map(function (d) { return d[0]; }), label: demo.map(function (d) { return d[1]; }) });
+    current = '50000190'; render();
+  }
+
+  if (!wire()) synth();
+  // standalone (no Sigma host behind the SDK): no config ever arrives -> demo data after 2.5 s
+  else setTimeout(function () { if (!gotConfig) synth(); }, 2500);
+  new ResizeObserver(function () { render(); }).observe(document.getElementById('wrap'));
+})();
+</script>
+</body>
+</html>
