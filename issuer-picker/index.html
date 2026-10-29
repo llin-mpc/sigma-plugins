@@ -16,6 +16,7 @@
     labelColumn   column   — the label shown ("Name - Alias - LX | LX - FIGI - CUSIP - Sector - Ticker")
     searchColumn  column   — optional lower-case haystack; falls back to the label
     issuer        variable — the issuer control (text / single-select list)
+    instr, trade  variable — controls cleared on a pick (setVariable with no value)
     onPick        action-trigger — fired after the control is set (clear instrument / trade side etc.)
     placeholder   text     — the empty-box hint
   Synthetic fallback: opened standalone (no Sigma client) it renders eight demo issuers so the UX can be tried anywhere.
@@ -55,7 +56,7 @@
   var cands = [];           // matching rows (source order)
   var idx = 0;              // highlighted candidate
   var cfg = {};             // editor-panel config
-  var varId = null, actId = null;
+  var varId = null, actId = null, instrId = null, tradeId = null;
   var MAXC = 500;
 
   var $box = document.getElementById('box'), $q = document.getElementById('q'), $cand = document.getElementById('cand'),
@@ -97,6 +98,9 @@
     if (!row) return;
     current = row.id;
     if (client && varId) { try { client.config.setVariable(varId, String(row.id)); } catch (e) { console.warn('setVariable', e); } }
+    // a pick also clears the instrument + trade side (the modal's row pick did); an action-set control fires no on-change
+    if (client && instrId) { try { client.config.setVariable(instrId); } catch (e) { console.warn('setVariable instr', e); } }
+    if (client && tradeId) { try { client.config.setVariable(tradeId); } catch (e) { console.warn('setVariable trade', e); } }
     if (client && actId) { setTimeout(function () { try { client.config.triggerAction(actId); } catch (e) { console.warn('triggerAction', e); } }, 0); }
     query = ''; cands = []; idx = 0; render();
   }
@@ -152,13 +156,15 @@
       { name: 'labelColumn', type: 'column', source: 'source', allowMultiple: false, label: 'Label' },
       { name: 'searchColumn', type: 'column', source: 'source', allowMultiple: false, label: 'Search text (optional)' },
       { name: 'issuer', type: 'variable', label: 'Issuer control', allowedTypes: ['text', 'text-list'] },
+      { name: 'instr', type: 'variable', label: 'Instrument control (cleared on pick)' },
+      { name: 'trade', type: 'variable', label: 'Trade control (cleared on pick)' },
       { name: 'onPick', type: 'action-trigger', label: 'On pick' },
       { name: 'placeholder', type: 'text', label: 'Placeholder', defaultValue: 'Name · FIGI · LoanX · CUSIP' }
     ]);
     client.config.subscribe(function (c) {
       gotConfig = true;
       cfg = c || {};
-      varId = cfg.issuer || null; actId = cfg.onPick || null;
+      varId = cfg.issuer || null; actId = cfg.onPick || null; instrId = cfg.instr || null; tradeId = cfg.trade || null;
       if (unsubVar) { try { unsubVar(); } catch (e) {} unsubVar = null; }
       if (varId) {
         try { unsubVar = client.config.subscribeToWorkbookVariable(varId, function (v) { current = unwrapVar(v); if (!query) render(); }); } catch (e) { console.warn('subscribeToWorkbookVariable', e); }
