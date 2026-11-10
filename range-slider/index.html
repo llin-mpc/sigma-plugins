@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Range slider — Sigma plugin</title>
+<!--
+  Bare two-handle range slider — a Sigma custom plugin (@sigmacomputing/plugin), single file, no build step.
+  A track and two handles, no end labels and no caption. Dragging a handle (or the selected band) and releasing writes the
+  band to a number-range control; a double-click resets it to the full range. Arrow keys nudge the focused handle.
+  Editor panel (bound from the workbook spec `config`):
+    range   variable — the number-range control the band is written to (setVariable(id, low, high))
+    min     text     — track minimum (default 0)
+    max     text     — track maximum (default 100)
+    step    text     — handle step (default 1)
+    color   text     — band and handle colour (default #2F4A6B)
+  Synthetic fallback: opened standalone (no Sigma host) it is a working slider with nothing bound.
+-->
+<style>
+  html,body{margin:0;padding:0;height:100%;background:transparent;overflow:hidden;-webkit-user-select:none;user-select:none;}
+  #wrap{position:relative;box-sizing:border-box;width:100%;height:100%;min-height:16px;padding:0 9px;touch-action:none;}
+  #rail,#band{position:absolute;top:50%;height:6px;margin-top:-3px;border-radius:3px;}
+  #rail{left:9px;right:9px;background:#D3D9E0;}
+  #band{background:var(--c,#2F4A6B);cursor:grab;}
+  #band.drag{cursor:grabbing;}
+  .h{position:absolute;top:50%;width:12px;height:12px;margin:-8px 0 0 -8px;border-radius:50%;background:#fff;border:2px solid var(--c,#2F4A6B);cursor:ew-resize;outline:0;}
+  .h:focus-visible{box-shadow:0 0 0 3px rgba(47,74,107,.25);}
+</style>
+</head>
+<body>
+<div id="wrap"><div id="rail"></div><div id="band"></div>
+  <div class="h" id="h0" tabindex="0" role="slider" aria-label="Range start"></div>
+  <div class="h" id="h1" tabindex="0" role="slider" aria-label="Range end"></div>
+</div>
+<script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/@sigmacomputing/plugin"></script>
+<script>
+(function () {
+  'use strict';
+  var SDK = window.SigmaPlugin || window.sigmaPlugin || null;
+  var client = SDK && SDK.client ? SDK.client : null;
+  var wrap = document.getElementById('wrap'), band = document.getElementById('band');
+  var hs = [document.getElementById('h0'), document.getElementById('h1')];
+  var PAD = 9;
+  var min = 0, max = 100, step = 1;
+  var val = [0, 100];          // current band
+  var varId = null, unsubVar = null, dragging = false;
+
+  function num(x, d) { var n = parseFloat(x); return isFinite(n) ? n : d; }
+  function clamp(v) { return Math.min(max, Math.max(min, v)); }
+  function snap(v) { return clamp(Math.round((v - min) / step) * step + min); }
+  function span() { return Math.max(1, wrap.clientWidth - 2 * PAD); }
+  function xOf(v) { return PAD + (max > min ? (v - min) / (max - min) : 0) * span(); }
+  function vOf(x) { return snap(min + (x - PAD) / span() * (max - min)); }
+
+  function render() {
+    var a = xOf(val[0]), b = xOf(val[1]);
+    hs[0].style.left = a + 'px'; hs[1].style.left = b + 'px';
+    band.style.left = a + 'px'; band.style.width = Math.max(0, b - a) + 'px';
+    for (var i = 0; i < 2; i++) { hs[i].setAttribute('aria-valuemin', min); hs[i].setAttribute('aria-valuemax', max); hs[i].setAttribute('aria-valuenow', val[i]); }
+  }
+
+  // a number-range variable arrives as {min, max}, {low, high}, [lo, hi] or null (nothing selected = full range)
+  function unwrap(v) {
+    var x = v && v.defaultValue !== undefined ? v.defaultValue : v;
+    if (x && x.value !== undefined) x = x.value;
+    var lo = null, hi = null;
+    if (Array.isArray(x)) { lo = x[0]; hi = x[1]; }
+    else if (x && typeof x === 'object') { lo = x.min !== undefined ? x.min : x.low; hi = x.max !== undefined ? x.max : x.high; }
+    lo = num(lo, min); hi = num(hi, max);
+    return [clamp(Math.min(lo, hi)), clamp(Math.max(lo, hi))];
+  }
+  function fromHost(v) { if (dragging) return; val = unwrap(v); render(); }
+  function commit() {
+    if (!client || !varId) return;
+    try { client.config.setVariable(varId, val[0], val[1]); } catch (e) { console.warn('setVariable', e); }
+  }
+
+  // ---------- pointer ----------
+  function localX(e) { return e.clientX - wrap.getBoundingClientRect().left; }
+  function dragHandle(i) {
+    hs[i].addEventListener('pointerdown', function (e) {
+      e.preventDefault(); hs[i].setPointerCapture(e.pointerId); hs[i].focus(); dragging = true;
+      function mv(ev) {
+        var v = vOf(localX(ev));
+        val[i] = i === 0 ? Math.min(v, val[1]) : Math.max(v, val[0]);
+        render();
+      }
+      function up(ev) {
+        hs[i].removeEventListener('pointermove', mv); hs[i].removeEventListener('pointerup', up); hs[i].removeEventListener('pointercancel', up);
+        try { hs[i].releasePointerCapture(ev.pointerId); } catch (x) {}
+        dragging = false; commit();
+      }
+      hs[i].addEventListener('pointermove', mv); hs[i].addEventListener('pointerup', up); hs[i].addEventListener('pointercancel', up);
+    });
+    hs[i].addEventListener('keydown', function (e) {
+      var d = e.key === 'ArrowLeft' || e.key === 'ArrowDown' ? -step : e.key === 'ArrowRight' || e.key === 'ArrowUp' ? step : 0;
+      if (!d) return;
+      e.preventDefault();
+      var v = snap(val[i] + d * (e.shiftKey ? 10 : 1));
+      val[i] = i === 0 ? Math.min(v, val[1]) : Math.max(v, val[0]);
+      render(); commit();
+    });
+  }
+  dragHandle(0); dragHandle(1);
+
+  // drag the band itself to slide the window
+  band.addEventListener('pointerdown', function (e) {
+    e.preventDefault(); band.setPointerCapture(e.pointerId); band.classList.add('drag'); dragging = true;
+    var x0 = localX(e), v0 = val.slice(), w = v0[1] - v0[0];
+    function mv(ev) {
+      var d = (localX(ev) - x0) / span() * (max - min);
+      var lo = snap(Math.min(max - w, Math.max(min, v0[0] + d)));
+      val = [lo, lo + w]; render();
+    }
+    function up(ev) {
+      band.removeEventListener('pointermove', mv); band.removeEventListener('pointerup', up); band.removeEventListener('pointercancel', up);
+      try { band.releasePointerCapture(ev.pointerId); } catch (x) {}
+      band.classList.remove('drag'); dragging = false; commit();
+    }
+    band.addEventListener('pointermove', mv); band.addEventListener('pointerup', up); band.addEventListener('pointercancel', up);
+  });
+  // a click on the empty rail moves the nearer handle there
+  wrap.addEventListener('pointerdown', function (e) {
+    if (e.target !== wrap && e.target.id !== 'rail') return;
+    var v = vOf(localX(e)), i = Math.abs(v - val[0]) <= Math.abs(v - val[1]) ? 0 : 1;
+    val[i] = i === 0 ? Math.min(v, val[1]) : Math.max(v, val[0]);
+    render(); commit();
+  });
+  wrap.addEventListener('dblclick', function () { val = [min, max]; render(); commit(); });
+
+  // ---------- Sigma wiring ----------
+  function wire() {
+    if (!client) return false;
+    client.config.configureEditorPanel([
+      { name: 'range', type: 'variable', label: 'Range control', allowedTypes: ['number-range'] },
+      { name: 'min', type: 'text', label: 'Minimum', defaultValue: '0' },
+      { name: 'max', type: 'text', label: 'Maximum', defaultValue: '100' },
+      { name: 'step', type: 'text', label: 'Step', defaultValue: '1' },
+      { name: 'color', type: 'text', label: 'Colour', defaultValue: '#2F4A6B' }
+    ]);
+    client.config.subscribe(function (c) {
+      c = c || {};
+      min = num(c.min, 0); max = num(c.max, 100); if (max <= min) max = min + 1;
+      step = Math.max(1e-9, num(c.step, 1));
+      if (c.color) wrap.style.setProperty('--c', String(c.color));
+      val = [clamp(val[0]), clamp(val[1])];
+      var id = c.range || null;
+      if (id !== varId) {
+        if (unsubVar) { try { unsubVar(); } catch (e) {} unsubVar = null; }
+        varId = id;
+        if (varId) {
+          try { unsubVar = client.config.subscribeToWorkbookVariable(varId, fromHost); } catch (e) { console.warn('subscribeToWorkbookVariable', e); }
+          try { var v0 = client.config.getVariable(varId); if (v0 && typeof v0.then === 'function') v0.then(fromHost); else fromHost(v0); } catch (e) {}
+        }
+      }
+      render();
+    });
+    return true;
+  }
+  wire();
+  render();
+  new ResizeObserver(render).observe(wrap);
+})();
+</script>
+</body>
+</html>
