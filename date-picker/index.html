@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Date picker — Sigma plugin</title>
+<!--
+  MPC date picker — a Sigma custom plugin (@sigmacomputing/plugin), single file, no build step.
+  A calendar of the previous and the current month: click days on and off, then Apply. Only days present in the source element
+  can be picked; every other day is greyed out. Nothing is written until Apply. Sigma plugins render inside a fixed iframe, so
+  the calendar lives inside the element's box (put it in a modal).
+  Editor panel (bound from the workbook spec `config`):
+    source       element  — one row per available day
+    dayColumn    column   — the day as text 'YYYY-MM-DD' (a date value also works)
+    countColumn  column   — optional number shown small under the day
+    dates        variable — a TEXT control; receives the picked days as 'YYYY-MM-DD,YYYY-MM-DD' (sorted), cleared when none
+    onApply      action-trigger — fired after the control is written (close the modal, switch a window, ...)
+    months       text     — how many months to show, ending with the current one (default 2)
+    color        text     — fill colour of a picked day (default #2F4A6B)
+  Synthetic fallback: opened standalone (no Sigma client) it enables the last five weekdays so the UX can be tried anywhere.
+-->
+<style>
+  :root { --fg:#1F2D3D; --muted:#9AA5B1; --line:#C9D2CC; --pick:#2F4A6B; --hover:#E6EAEE; --font:"Inter",-apple-system,"Segoe UI","Helvetica Neue",Arial,sans-serif; }
+  html,body{margin:0;padding:0;height:100%;background:transparent;font-family:var(--font);color:var(--fg);}
+  #wrap{box-sizing:border-box;height:100%;display:flex;flex-direction:column;padding:4px 6px;}
+  #months{flex:1 1 auto;display:flex;flex-wrap:wrap;gap:8px 28px;justify-content:center;align-content:flex-start;overflow:auto;}
+  .month{flex:0 0 auto;}
+  .mtitle{font-size:13px;font-weight:700;text-align:center;margin:2px 0 6px;}
+  .grid{display:grid;grid-template-columns:repeat(7,34px);grid-auto-rows:34px;gap:2px;}
+  .dow{font-size:10px;font-weight:700;color:#6B7684;display:flex;align-items:center;justify-content:center;height:20px;}
+  .grid.head{grid-auto-rows:20px;margin-bottom:2px;}
+  .day{box-sizing:border-box;border:1px solid transparent;border-radius:4px;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:12px;line-height:13px;color:var(--muted);user-select:none;}
+  .day.on{color:var(--fg);font-weight:700;cursor:pointer;border-color:var(--line);background:#fff;}
+  .day.on:hover{background:var(--hover);}
+  .day.on:focus-visible{outline:2px solid var(--pick);outline-offset:1px;}
+  .day.picked,.day.picked:hover{background:var(--pick);border-color:var(--pick);color:#fff;}
+  .day.today{text-decoration:underline;}
+  .cnt{font-size:9px;font-weight:400;line-height:10px;opacity:.8;}
+  #foot{flex:0 0 auto;display:flex;align-items:center;gap:10px;padding-top:8px;margin-top:6px;border-top:1px solid var(--line);}
+  #info{flex:1 1 auto;font-size:12px;color:#6B7684;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  button{font:inherit;font-size:12px;font-weight:700;border-radius:4px;padding:5px 14px;cursor:pointer;}
+  #clear{background:#fff;border:1px solid var(--line);color:var(--fg);}
+  #apply{background:var(--pick);border:1px solid var(--pick);color:#fff;}
+  #apply:disabled{opacity:.45;cursor:default;}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="months" role="group" aria-label="Pick days"></div>
+  <div id="foot"><button id="clear" type="button">Clear</button><span id="info"></span><button id="apply" type="button">Apply</button></div>
+</div>
+<script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/@sigmacomputing/plugin"></script>
+<script>
+(function () {
+  'use strict';
+  var SDK = window.SigmaPlugin || window.sigmaPlugin || null;
+  var client = SDK && SDK.client ? SDK.client : null;
+
+  // ---------- state ----------
+  var avail = Object.create(null);   // 'YYYY-MM-DD' -> count (or null)
+  var picked = Object.create(null);  // 'YYYY-MM-DD' -> true (the working selection)
+  var applied = '';                  // the control's current value ('a,b')
+  var touched = false;               // the user changed the selection since it was last synced from the control
+  var cfg = {};
+  var varId = null, actId = null;
+  var MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+  var DOW = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'];
+  var $months = document.getElementById('months'), $info = document.getElementById('info'),
+      $apply = document.getElementById('apply'), $clear = document.getElementById('clear');
+
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+  function iso(y, m, d) { return y + '-' + pad(m + 1) + '-' + pad(d); }
+  function toDay(v) {
+    if (v == null) return null;
+    if (typeof v === 'number') { var dt = new Date(v); return isNaN(dt) ? null : dt.toISOString().slice(0, 10); }
+    var s = String(v); var m = /^(\d{4}-\d{2}-\d{2})/.exec(s);
+    return m ? m[1] : null;
+  }
+  function pickedList() { return Object.keys(picked).sort(); }
+  function parseList(s) { var o = Object.create(null); String(s || '').split(',').forEach(function (x) { var d = toDay(x.trim()); if (d) o[d] = true; }); return o; }
+  function shortDay(d) { return Number(d.slice(5, 7)) + '/' + Number(d.slice(8, 10)); }
+
+  function render() {
+    var now = new Date(), n = Math.max(1, Math.min(6, parseInt(cfg.months, 10) || 2));
+    var todayIso = iso(now.getFullYear(), now.getMonth(), now.getDate());
+    if (cfg.color) document.documentElement.style.setProperty('--pick', cfg.color);
+    $months.innerHTML = '';
+    for (var k = n - 1; k >= 0; k--) {
+      var first = new Date(now.getFullYear(), now.getMonth() - k, 1), y = first.getFullYear(), m = first.getMonth();
+      var box = document.createElement('div'); box.className = 'month';
+      var t = document.createElement('div'); t.className = 'mtitle'; t.textContent = MONTHS[m] + ' ' + y; box.appendChild(t);
+      var head = document.createElement('div'); head.className = 'grid head';
+      DOW.forEach(function (w) { var c = document.createElement('div'); c.className = 'dow'; c.textContent = w; head.appendChild(c); });
+      box.appendChild(head);
+      var grid = document.createElement('div'); grid.className = 'grid';
+      var lead = (first.getDay() + 6) % 7, days = new Date(y, m + 1, 0).getDate();
+      for (var i = 0; i < lead; i++) grid.appendChild(document.createElement('div'));
+      for (var d = 1; d <= days; d++) {
+        var id = iso(y, m, d), cell = document.createElement('div'), on = id in avail;
+        cell.className = 'day' + (on ? ' on' : '') + (picked[id] ? ' picked' : '') + (id === todayIso ? ' today' : '');
+        cell.textContent = d;
+        if (on) {
+          cell.setAttribute('data-day', id); cell.setAttribute('role', 'button'); cell.setAttribute('tabindex', '0');
+          cell.setAttribute('aria-pressed', picked[id] ? 'true' : 'false');
+          if (avail[id] != null) { var c2 = document.createElement('span'); c2.className = 'cnt'; c2.textContent = avail[id]; cell.appendChild(c2); }
+        } else if (picked[id]) { cell.className += ' on'; cell.setAttribute('data-day', id); }   // a picked day that lost its data can still be un-picked
+        grid.appendChild(cell);
+      }
+      box.appendChild(grid); $months.appendChild(box);
+    }
+    var list = pickedList();
+    $info.textContent = list.length ? list.length + (list.length === 1 ? ' day: ' : ' days: ') + list.map(shortDay).join(', ')
+                                    : (Object.keys(avail).length ? 'Pick one or more days' : 'No days available');
+    $apply.disabled = list.join(',') === applied;
+  }
+  function toggle(id) { if (!id) return; if (picked[id]) delete picked[id]; else picked[id] = true; touched = true; render(); }
+  $months.addEventListener('click', function (e) { var c = e.target.closest ? e.target.closest('[data-day]') : null; if (c) toggle(c.getAttribute('data-day')); });
+  $months.addEventListener('keydown', function (e) {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    var c = e.target.closest ? e.target.closest('[data-day]') : null; if (c) { e.preventDefault(); toggle(c.getAttribute('data-day')); }
+  });
+  $clear.addEventListener('click', function () { picked = Object.create(null); touched = true; render(); });
+  $apply.addEventListener('click', function () {
+    var v = pickedList().join(',');
+    applied = v; touched = false;
+    if (client && varId) { try { if (v) client.config.setVariable(varId, v); else client.config.setVariable(varId); } catch (e) { console.warn('setVariable', e); } }
+    else console.log('date-picker apply:', v);
+    if (client && actId) { setTimeout(function () { try { client.config.triggerAction(actId); } catch (e) { console.warn('triggerAction', e); } }, 0); }
+    render();
+  });
+
+  // ---------- data ----------
+  function ingest(data) {
+    var dc = cfg.dayColumn, cc = cfg.countColumn;
+    if (!dc || !data || !data[dc]) return;
+    var days = data[dc], cnts = cc && data[cc] ? data[cc] : null, out = Object.create(null);
+    for (var i = 0; i < days.length; i++) { var d = toDay(days[i]); if (d) out[d] = cnts && cnts[i] != null ? cnts[i] : null; }
+    avail = out; render();
+  }
+  function unwrapVar(raw) {
+    if (raw == null) return '';
+    if (typeof raw !== 'object') return String(raw);
+    var v = raw.defaultValue && raw.defaultValue.value !== undefined ? raw.defaultValue.value : (raw.value !== undefined ? raw.value : null);
+    if (Array.isArray(v)) v = v.length ? v[0] : null;
+    return v == null ? '' : String(v);
+  }
+  function syncFromControl(v) {
+    applied = pickedListOf(parseList(unwrapVar(v))).join(',');
+    if (!touched) picked = parseList(applied);
+    render();
+  }
+  function pickedListOf(o) { return Object.keys(o).sort(); }
+
+  var unsubData = null, unsubVar = null, gotConfig = false;
+  function wire() {
+    if (!client) return false;
+    client.config.configureEditorPanel([
+      { name: 'source', type: 'element', label: 'Available days' },
+      { name: 'dayColumn', type: 'column', source: 'source', allowMultiple: false, label: 'Day (YYYY-MM-DD)' },
+      { name: 'countColumn', type: 'column', source: 'source', allowMultiple: false, label: 'Count (optional)' },
+      { name: 'dates', type: 'variable', label: 'Dates control (text)', allowedTypes: ['text', 'text-list'] },
+      { name: 'onApply', type: 'action-trigger', label: 'On apply' },
+      { name: 'months', type: 'text', label: 'Months shown', defaultValue: '2' },
+      { name: 'color', type: 'text', label: 'Picked colour', defaultValue: '#2F4A6B' }
+    ]);
+    client.config.subscribe(function (c) {
+      gotConfig = true;
+      cfg = c || {};
+      varId = cfg.dates || null; actId = cfg.onApply || null;
+      if (unsubVar) { try { unsubVar(); } catch (e) {} unsubVar = null; }
+      if (varId) {
+        try { unsubVar = client.config.subscribeToWorkbookVariable(varId, syncFromControl); } catch (e) { console.warn('subscribeToWorkbookVariable', e); }
+        try { var v0 = client.config.getVariable(varId); if (v0 && typeof v0.then === 'function') v0.then(syncFromControl); else syncFromControl(v0); } catch (e) {}
+      }
+      if (unsubData) { try { unsubData(); } catch (e) {} unsubData = null; }
+      if (cfg.source) unsubData = client.elements.subscribeToElementData(cfg.source, ingest);
+      render();
+    });
+    return true;
+  }
+
+  // ---------- synthetic fallback ----------
+  function synth() {
+    var days = [], cnts = [], d = new Date();
+    while (days.length < 5) { var w = d.getDay(); if (w !== 0 && w !== 6) { days.push(iso(d.getFullYear(), d.getMonth(), d.getDate())); cnts.push(10 + days.length * 7); } d.setDate(d.getDate() - 1); }
+    cfg = { dayColumn: 'day', countColumn: 'n', months: '2' };
+    ingest({ day: days, n: cnts });
+  }
+
+  render();
+  if (!wire()) synth();
+  // standalone (no Sigma host behind the SDK): no config ever arrives -> demo days after 2.5 s
+  else setTimeout(function () { if (!gotConfig) synth(); }, 2500);
+})();
+</script>
+</body>
+</html>
