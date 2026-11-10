@@ -6,15 +6,18 @@
 <title>Date picker — Sigma plugin</title>
 <!--
   MPC date picker — a Sigma custom plugin (@sigmacomputing/plugin), single file, no build step.
-  A calendar of the previous and the current month: click days on and off, then Apply. Only days present in the source element
-  can be picked; every other day is greyed out. Nothing is written until Apply. Sigma plugins render inside a fixed iframe, so
-  the calendar lives inside the element's box (put it in a modal).
+  A calendar of the previous and the current month: click days on and off. Only days present in the source element can be
+  picked; every other day is greyed out. mode 'apply' (default): nothing is written until Apply. mode 'live': no Apply button,
+  the selection is written shortly after the last click (use it inside a modal that has its own Done button — Sigma takes no
+  spec-authored actions on a plugin's action trigger, so the plugin cannot close a modal by itself). Sigma plugins render inside
+  a fixed iframe, so the calendar lives inside the element's box.
   Editor panel (bound from the workbook spec `config`):
     source       element  — one row per available day
     dayColumn    column   — the day as text 'YYYY-MM-DD' (a date value also works)
     countColumn  column   — optional number shown small under the day
     dates        variable — a TEXT control; receives the picked days as 'YYYY-MM-DD,YYYY-MM-DD' (sorted), cleared when none
-    onApply      action-trigger — fired after the control is written (close the modal, switch a window, ...)
+    onApply      action-trigger — fired after the control is written (optional)
+    mode         text     — 'apply' (default) or 'live'
     months       text     — how many months to show, ending with the current one (default 2)
     color        text     — fill colour of a picked day (default #2F4A6B)
   Synthetic fallback: opened standalone (no Sigma client) it enables the last five weekdays so the UX can be tried anywhere.
@@ -63,7 +66,8 @@
   var applied = '';                  // the control's current value ('a,b')
   var touched = false;               // the user changed the selection since it was last synced from the control
   var cfg = {};
-  var varId = null, actId = null;
+  var varId = null, actId = null, liveTimer = null;
+  function isLive() { return String(cfg.mode || '').toLowerCase() === 'live'; }
   var MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
   var DOW = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'];
   var $months = document.getElementById('months'), $info = document.getElementById('info'),
@@ -113,22 +117,28 @@
     $info.textContent = list.length ? list.length + (list.length === 1 ? ' day: ' : ' days: ') + list.map(shortDay).join(', ')
                                     : (Object.keys(avail).length ? 'Pick one or more days' : 'No days available');
     $apply.disabled = list.join(',') === applied;
+    $apply.style.display = isLive() ? 'none' : '';
   }
-  function toggle(id) { if (!id) return; if (picked[id]) delete picked[id]; else picked[id] = true; touched = true; render(); }
-  $months.addEventListener('click', function (e) { var c = e.target.closest ? e.target.closest('[data-day]') : null; if (c) toggle(c.getAttribute('data-day')); });
-  $months.addEventListener('keydown', function (e) {
-    if (e.key !== 'Enter' && e.key !== ' ') return;
-    var c = e.target.closest ? e.target.closest('[data-day]') : null; if (c) { e.preventDefault(); toggle(c.getAttribute('data-day')); }
-  });
-  $clear.addEventListener('click', function () { picked = Object.create(null); touched = true; render(); });
-  $apply.addEventListener('click', function () {
+  function write() {
     var v = pickedList().join(',');
     applied = v; touched = false;
     if (client && varId) { try { if (v) client.config.setVariable(varId, v); else client.config.setVariable(varId); } catch (e) { console.warn('setVariable', e); } }
     else console.log('date-picker apply:', v);
     if (client && actId) { setTimeout(function () { try { client.config.triggerAction(actId); } catch (e) { console.warn('triggerAction', e); } }, 0); }
     render();
+  }
+  function changed() {
+    touched = true; render();
+    if (isLive()) { if (liveTimer) clearTimeout(liveTimer); liveTimer = setTimeout(function () { liveTimer = null; write(); }, 700); }
+  }
+  function toggle(id) { if (!id) return; if (picked[id]) delete picked[id]; else picked[id] = true; changed(); }
+  $months.addEventListener('click', function (e) { var c = e.target.closest ? e.target.closest('[data-day]') : null; if (c) toggle(c.getAttribute('data-day')); });
+  $months.addEventListener('keydown', function (e) {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    var c = e.target.closest ? e.target.closest('[data-day]') : null; if (c) { e.preventDefault(); toggle(c.getAttribute('data-day')); }
   });
+  $clear.addEventListener('click', function () { picked = Object.create(null); changed(); });
+  $apply.addEventListener('click', write);
 
   // ---------- data ----------
   function ingest(data) {
@@ -161,6 +171,7 @@
       { name: 'countColumn', type: 'column', source: 'source', allowMultiple: false, label: 'Count (optional)' },
       { name: 'dates', type: 'variable', label: 'Dates control (text)', allowedTypes: ['text', 'text-list'] },
       { name: 'onApply', type: 'action-trigger', label: 'On apply' },
+      { name: 'mode', type: 'text', label: "Mode: 'apply' or 'live'", defaultValue: 'apply' },
       { name: 'months', type: 'text', label: 'Months shown', defaultValue: '2' },
       { name: 'color', type: 'text', label: 'Picked colour', defaultValue: '#2F4A6B' }
     ]);
@@ -184,7 +195,7 @@
   function synth() {
     var days = [], cnts = [], d = new Date();
     while (days.length < 5) { var w = d.getDay(); if (w !== 0 && w !== 6) { days.push(iso(d.getFullYear(), d.getMonth(), d.getDate())); cnts.push(10 + days.length * 7); } d.setDate(d.getDate() - 1); }
-    cfg = { dayColumn: 'day', countColumn: 'n', months: '2' };
+    cfg = { dayColumn: 'day', countColumn: 'n', months: '2', mode: /[?&]mode=live/.test(location.search) ? 'live' : 'apply' };
     ingest({ day: days, n: cnts });
   }
 
